@@ -69,8 +69,8 @@ LLM_MODEL    = "qwen-plus"
 # ---- 7. 邮件 ----
 MAIL_HOST = "smtp.qq.com"
 MAIL_PORT = 465
-MAIL_FROM = "your_account@qq.com"
-MAIL_TO   = ["your_account@qq.com"]
+MAIL_FROM = "974808867@qq.com"
+MAIL_TO   = ["974808867@qq.com"]
 MAIL_SUBJECT_PREFIX = "【超跌反弹监控】"
 
 SKIP_NON_TRADE_DAY = True
