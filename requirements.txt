@@ -2,4 +2,4 @@ akshare
 pandas
 requests
 yfinance
- 
+tushare
