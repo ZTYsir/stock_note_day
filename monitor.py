@@ -5,9 +5,9 @@
 - 只对连续下跌的标的做 LLM 综合分析（超跌反弹角度），结合多源财经新闻
 - 输出各时间窗口累积跌幅 + 连续下跌天数，交易日定时发邮件
 
-数据源: 双源容错(akshare 东财 + yfinance 雅虎)，海外 runner 上东财常被拒连时自动切雅虎
+数据源: 5 源容错(东财/新浪/腾讯/雅虎/Tushare)，海外 runner 上自动让能通的源优先
 LLM: 云端 OpenAI 兼容接口(千问/DeepSeek 通用)
-仅需 2 个 GitHub Secret: LLM_API_KEY(必填) / MAIL_PASS(邮箱授权码, 必填)
+Secret: LLM_API_KEY(必填) / MAIL_PASS(必填) / TUSHARE_TOKEN(可选，配了才启用 Tushare 源)
 """
 import os
 import time
@@ -28,9 +28,9 @@ WATCH_LIST = {
     "510300": ("沪深300ETF",  "etf"),
 }
 
-# ---- 2. 数据源优先级（从左到右依次尝试，前面失败自动切后面）----
-#   在 GitHub 海外 runner 上东财常被拒连，可把 "yfinance" 放前面
-DATA_SOURCES = ["akshare", "yfinance"]
+# ---- 2. 数据源（从左到右依次尝试，前面失败自动切后面）----
+#   akshare_em=东财  akshare_sina=新浪  akshare_tx=腾讯  yfinance=雅虎  tushare=Tushare(需token)
+DATA_SOURCES = ["akshare_em", "akshare_sina", "akshare_tx", "yfinance", "tushare"]
 
 # ---- 3. 触发：连续下跌达到这些天数才分析（取命中的最大档）----
 DOWN_THRESHOLDS = [3, 5, 7]
@@ -42,7 +42,7 @@ PCT_WINDOWS = {
 }
 LOOKBACK_DAYS = 400
 RSI_PERIOD    = 14
-ADJUST        = "qfq"      # 仅 akshare 生效: "" / "qfq" / "hfq"
+ADJUST        = "qfq"      # akshare 复权: "" / "qfq" / "hfq"
 
 # ---- 5. 财经新闻源（多源冗余，海外 runner 上部分会失效，能抓几个算几个）----
 NEWS_SOURCES = [
@@ -74,77 +74,110 @@ MAIL_TO   = ["your_account@qq.com"]
 MAIL_SUBJECT_PREFIX = "【超跌反弹监控】"
 
 SKIP_NON_TRADE_DAY = True
-REQUEST_SLEEP = 0.5        # 各接口调用间隔，降低被限流概率
-FETCH_RETRY   = 2         # 单个数据源失败后的重试次数
+REQUEST_SLEEP = 0.5
+FETCH_RETRY   = 2
 # =====================================================================
 
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-MAIL_PASS   = os.environ.get("MAIL_PASS", "")
+LLM_API_KEY   = os.environ.get("LLM_API_KEY", "")
+MAIL_PASS     = os.environ.get("MAIL_PASS", "")
+TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")
 
-# GitHub Actions(海外 runner)上东财基本被拒连，自动让雅虎优先；本地跑保持东财优先(数据更准)
+# GitHub Actions(海外 runner)上国内源基本被拒，自动让海外源(雅虎/Tushare)优先
 if os.environ.get("GITHUB_ACTIONS") == "true":
-    DATA_SOURCES = ["yfinance", "akshare"]
-    print("[info] 检测到 GitHub Actions 环境，数据源优先级切为 yfinance -> akshare")
+    DATA_SOURCES = ["yfinance", "tushare", "akshare_em", "akshare_sina", "akshare_tx"]
+    print("[info] 检测到 GitHub Actions 环境，数据源优先级切为海外源优先")
 
 
 def _today_str() -> str:
     return dt.date.today().strftime("%Y%m%d")
 
 
+def _is_sh(code: str) -> bool:
+    return code.startswith(("5", "6", "9", "11", "68"))
+
+
 def is_trade_day(today: dt.date) -> bool:
     try:
         import akshare as ak
         cal = ak.tool_trade_date_hist_sina()
-        days = set(pd.to_datetime(cal["trade_date"]).dt.date)
-        return today in days
+        return today in set(pd.to_datetime(cal["trade_date"]).dt.date)
     except Exception as e:
         print(f"[warn] 交易日历获取失败，默认按交易日处理: {e}")
         return True
 
 
-# ---------------- 数据获取：双源容错 ----------------
-def _to_yahoo_symbol(code: str) -> str:
-    """A股代码 -> 雅虎代码。上海 .SS / 深圳 .SZ"""
-    if code.startswith(("5", "6", "9", "11", "68")):   # 上海: 股/科创/ETF/转债
-        return code + ".SS"
-    return code + ".SZ"                                 # 深圳: 0股/3创业/15,16 ETF
-
-
-def _fetch_akshare(code: str, asset_type: str) -> pd.DataFrame:
-    import akshare as ak
-    end = dt.date.today()
-    s = (end - dt.timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
-    e = end.strftime("%Y%m%d")
-    if asset_type == "etf":
-        df = ak.fund_etf_hist_em(symbol=code, period="daily",
-                                 start_date=s, end_date=e, adjust=ADJUST)
-    else:
-        df = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                start_date=s, end_date=e, adjust=ADJUST)
-    df = df.rename(columns={"日期": "date", "收盘": "close"})[["date", "close"]].copy()
-    df["date"] = pd.to_datetime(df["date"])
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    return df.dropna().sort_values("date").reset_index(drop=True)
-
-
-def _fetch_yfinance(code: str, asset_type: str) -> pd.DataFrame:
-    import yfinance as yf
-    sym = _to_yahoo_symbol(code)
-    hist = yf.Ticker(sym).history(period="2y", auto_adjust=True)
-    if hist is None or hist.empty:
-        raise ValueError(f"雅虎无数据({sym})")
-    df = hist.reset_index()[["Date", "Close"]].rename(
-        columns={"Date": "date", "Close": "close"})
+# ==================== 数据源（每个源一个函数，统一返回 date/close 升序）====================
+def _std(df: pd.DataFrame, date_col: str, close_col: str) -> pd.DataFrame:
+    df = df[[date_col, close_col]].rename(columns={date_col: "date", close_col: "close"})
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     return df.dropna().sort_values("date").reset_index(drop=True)
 
 
-def fetch_hist(code: str, asset_type: str) -> pd.DataFrame:
+def _src_akshare_em(code, atype):          # 东方财富
+    import akshare as ak
+    s = (dt.date.today() - dt.timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
+    e = _today_str()
+    if atype == "etf":
+        df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=s, end_date=e, adjust=ADJUST)
+    else:
+        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=s, end_date=e, adjust=ADJUST)
+    return _std(df, "日期", "收盘")
+
+
+def _src_akshare_sina(code, atype):        # 新浪(ETF 支持不保证，失败自动跳过)
+    import akshare as ak
+    sym = ("sh" if _is_sh(code) else "sz") + code
+    df = ak.stock_zh_a_daily(symbol=sym, adjust="qfq")
+    return _std(df, "date", "close").tail(300).reset_index(drop=True)
+
+
+def _src_akshare_tx(code, atype):          # 腾讯
+    import akshare as ak
+    sym = ("sh" if _is_sh(code) else "sz") + code
+    s = (dt.date.today() - dt.timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
+    df = ak.stock_zh_a_hist_tx(symbol=sym, start_date=s, end_date=_today_str(), adjust="qfq")
+    return _std(df, "date", "close")
+
+
+def _src_yfinance(code, atype):            # 雅虎
+    import yfinance as yf
+    sym = code + (".SS" if _is_sh(code) else ".SZ")
+    hist = yf.Ticker(sym).history(period="2y", auto_adjust=True)
+    if hist is None or hist.empty:
+        raise ValueError(f"雅虎无数据({sym})")
+    return _std(hist.reset_index(), "Date", "Close")
+
+
+def _src_tushare(code, atype):             # Tushare(需 token，海外可访问)
+    if not TUSHARE_TOKEN:
+        raise ValueError("未配置 TUSHARE_TOKEN")
+    import tushare as ts
+    pro = ts.pro_api(TUSHARE_TOKEN)
+    ts_code = code + (".SH" if _is_sh(code) else ".SZ")
+    s = (dt.date.today() - dt.timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
+    e = _today_str()
+    raw = (pro.fund_daily(ts_code=ts_code, start_date=s, end_date=e) if atype == "etf"
+           else pro.daily(ts_code=ts_code, start_date=s, end_date=e))
+    return _std(raw, "trade_date", "close")
+
+
+SOURCE_FUNCS = {
+    "akshare_em": _src_akshare_em,
+    "akshare_sina": _src_akshare_sina,
+    "akshare_tx": _src_akshare_tx,
+    "yfinance": _src_yfinance,
+    "tushare": _src_tushare,
+}
+
+
+def fetch_hist(code, asset_type):
     """按 DATA_SOURCES 顺序尝试各数据源，全部失败才抛错"""
     errors = []
     for source in DATA_SOURCES:
-        fn = _fetch_akshare if source == "akshare" else _fetch_yfinance
+        fn = SOURCE_FUNCS.get(source)
+        if fn is None:
+            continue
         for attempt in range(FETCH_RETRY):
             try:
                 df = fn(code, asset_type)
@@ -155,13 +188,13 @@ def fetch_hist(code: str, asset_type: str) -> pd.DataFrame:
                 errors.append(f"{source}:数据过短({len(df)})")
                 break
             except Exception as ex:
-                errors.append(f"{source}#{attempt+1}:{ex}")
+                errors.append(f"{source}#{attempt+1}:{str(ex)[:60]}")
                 time.sleep(REQUEST_SLEEP)
     raise RuntimeError(" | ".join(errors))
 
 
-# ---------------- 计算 ----------------
-def consecutive_down_days(closes: pd.Series) -> int:
+# ==================== 计算 ====================
+def consecutive_down_days(closes):
     n = 0
     for i in range(len(closes) - 1, 0, -1):
         if closes.iloc[i] < closes.iloc[i - 1]:
@@ -171,7 +204,7 @@ def consecutive_down_days(closes: pd.Series) -> int:
     return n
 
 
-def window_pcts(closes: pd.Series) -> dict:
+def window_pcts(closes):
     last = closes.iloc[-1]
     out = {}
     for label, k in PCT_WINDOWS.items():
@@ -185,7 +218,7 @@ def window_pcts(closes: pd.Series) -> dict:
     return out
 
 
-def calc_rsi(closes: pd.Series, period: int = 14) -> float:
+def calc_rsi(closes, period=14):
     delta = closes.diff()
     ag = delta.clip(lower=0).ewm(alpha=1 / period, min_periods=period).mean()
     al = (-delta.clip(upper=0)).ewm(alpha=1 / period, min_periods=period).mean()
@@ -194,35 +227,33 @@ def calc_rsi(closes: pd.Series, period: int = 14) -> float:
 
 
 def scan():
-    """返回 (命中列表, 失败列表)。失败列表用于区分'数据挂了'和'无信号'"""
-    hits, failed = [], []
+    """扫描所有标的，返回全部结果(不过滤)。is_hit 标记是否达到连跌阈值"""
+    results, failed = [], []
     for code, (name, atype) in WATCH_LIST.items():
         try:
             df = fetch_hist(code, atype)
             closes = df["close"]
             down = consecutive_down_days(closes)
             threshold = max([d for d in DOWN_THRESHOLDS if down >= d], default=0)
-            if threshold == 0:
-                print(f"[ok] {name}({code}) 连跌{down}天(未达阈值)")
-                continue
-            hits.append({
-                "code": code, "name": name, "down_days": down, "threshold": threshold,
+            results.append({
+                "code": code, "name": name, "down_days": down,
+                "is_hit": threshold > 0, "threshold": threshold,
                 "last_close": round(float(closes.iloc[-1]), 3),
                 "rsi": calc_rsi(closes, RSI_PERIOD), "pcts": window_pcts(closes),
             })
-            print(f"[hit] {name}({code}) 连跌{down}天 RSI={hits[-1]['rsi']}")
+            print(f"[{'hit' if threshold>0 else 'ok'}] {name}({code}) 连跌{down}天"
+                  + ("  ★达阈值" if threshold > 0 else ""))
         except Exception as ex:
             failed.append((code, name, str(ex)))
             print(f"[fail] {name}({code}) 所有数据源失败: {ex}")
-    return hits, failed
+    return results, failed
 
 
-# ---------------- 新闻 ----------------
+# ==================== 新闻 ====================
 def _extract_titles(df, n):
     if df is None or len(df) == 0:
         return []
-    tc = [c for c in df.columns
-          if any(k in str(c) for k in ["标题", "内容", "title", "摘要", "简介"])]
+    tc = [c for c in df.columns if any(k in str(c) for k in ["标题", "内容", "title", "摘要", "简介"])]
     col = tc[0] if tc else df.columns[0]
     return df[col].dropna().astype(str).str.strip().head(n).tolist()
 
@@ -290,7 +321,7 @@ def analyze_with_llm(hits, market_news, stock_news):
         return f"（LLM 调用失败：{ex}）"
 
 
-# ---------------- 邮件 ----------------
+# ==================== 邮件 ====================
 def _send(subject, html):
     import smtplib
     from email.mime.text import MIMEText
@@ -305,7 +336,7 @@ def _send(subject, html):
     print("[ok] 邮件已发送")
 
 
-def send_report(hits, ai_text, news_count, failed):
+def send_report(results, hit_items, ai_text, news_count, failed):
     win_headers = "".join(f"<th>{k}</th>" for k in PCT_WINDOWS.keys())
 
     def cell(v):
@@ -315,21 +346,34 @@ def send_report(hits, ai_text, news_count, failed):
         return f"<td style='text-align:right;color:{color}'>{v}%</td>"
 
     rows = ""
-    for h in hits:
+    for h in results:
         cells = "".join(cell(h["pcts"].get(k, h["pcts"].get(k + "*"))) for k in PCT_WINDOWS)
-        rows += (f"<tr><td>{h['name']}</td><td>{h['code']}</td>"
-                 f"<td style='text-align:center'><b>{h['down_days']}</b></td>"
+        hit = h["is_hit"]
+        # 连续下跌达阈值的标的：整行加粗 + 淡黄底高亮，名称前加🔻
+        row_style = "font-weight:bold;background:#fff8e1" if hit else ""
+        name = ("🔻 " + h["name"]) if hit else h["name"]
+        rows += (f"<tr style='{row_style}'><td>{name}</td><td>{h['code']}</td>"
+                 f"<td style='text-align:center'>{h['down_days']}</td>"
                  f"<td style='text-align:right'>{h['last_close']}</td>"
                  f"<td style='text-align:center'>{h['rsi']}</td>{cells}</tr>")
     fail_note = ""
     if failed:
         items = "".join(f"<li>{n}({c})：{e[:80]}</li>" for c, n, e in failed)
-        fail_note = (f"<p style='color:#e67e22'>⚠ 有 {len(failed)} 个标的未取到数据"
-                     f"（本次报告不含它们）：</p><ul style='color:#e67e22;font-size:12px'>{items}</ul>")
+        fail_note = (f"<p style='color:#e67e22'>⚠ 有 {len(failed)} 个标的未取到数据：</p>"
+                     f"<ul style='color:#e67e22;font-size:12px'>{items}</ul>")
+
+    if hit_items:
+        ai_section = (f"<h3>AI 超跌反弹分析（{len(hit_items)} 个连跌标的，结合 {news_count} 条快讯）</h3>"
+                      f"<div style='background:#fafafa;padding:12px;border-radius:6px;line-height:1.7'>"
+                      f"{ai_text.replace(chr(10),'<br>')}</div>")
+    else:
+        ai_section = ("<p style='color:#888'>今日无标的达到连续下跌阈值"
+                      f"（≥{min(DOWN_THRESHOLDS)}天），暂无超跌反弹分析。</p>")
+
     html = f"""
     <div style="font-family:sans-serif;max-width:960px">
-      <h2>超跌反弹监控报告 · {dt.date.today()}</h2>
-      <p>命中连续下跌标的 <b>{len(hits)}</b> 个 ｜ 参考财经快讯 {news_count} 条</p>
+      <h2>超跌反弹监控 · 全景报告 · {dt.date.today()}</h2>
+      <p>监控标的 <b>{len(results)}</b> 个 ｜ 其中连续下跌达阈值 <b style="color:#c0392b">{len(hit_items)}</b> 个（🔻加粗行）</p>
       {fail_note}
       <div style="overflow-x:auto">
       <table border="1" cellspacing="0" cellpadding="6"
@@ -338,24 +382,22 @@ def send_report(hits, ai_text, news_count, failed):
           <th>名称</th><th>代码</th><th>连跌<br>天数</th><th>最新价</th><th>RSI</th>{win_headers}
         </tr>{rows}
       </table></div>
-      <p style="font-size:12px;color:#999">带 * 的窗口表示历史数据不足，按可得最早数据计算</p>
-      <h3>AI 综合分析（结合新闻）</h3>
-      <div style="background:#fafafa;padding:12px;border-radius:6px;line-height:1.7">{ai_text.replace(chr(10),'<br>')}</div>
+      <p style="font-size:12px;color:#999">🔻加粗 = 连续下跌达阈值；带 * 的窗口表示历史数据不足，按可得最早数据计算</p>
+      {ai_section}
       <p style="color:#999;font-size:12px;margin-top:16px">
         本报告由自动化脚本生成，仅供研究参考，不构成投资建议。连续下跌不必然反弹，请自行核实并控制风险。
       </p>
     </div>"""
-    _send(f"{MAIL_SUBJECT_PREFIX}{dt.date.today()} 命中{len(hits)}个超跌标的", html)
+    _send(f"{MAIL_SUBJECT_PREFIX}{dt.date.today()} 全景({len(results)}标的/{len(hit_items)}连跌)", html)
 
 
 def send_data_alert(failed):
-    """所有标的都取不到数据时，发告警邮件（而不是静默当成'无信号'）"""
     items = "".join(f"<li>{n}({c})：{e[:120]}</li>" for c, n, e in failed)
     html = f"""
     <div style="font-family:sans-serif;max-width:720px">
       <h2 style="color:#c0392b">⚠ 数据源异常，今日未能获取任何行情</h2>
       <p>全部 {len(failed)} 个标的的所有数据源都失败了，<b>这不代表今日无信号，而是没抓到数据</b>。
-         常见原因：GitHub 海外 runner 被东财拒连、雅虎限流。可稍后手动重跑，或调整配置区 DATA_SOURCES 顺序。</p>
+         常见原因：GitHub 海外 runner 被国内源拒连、雅虎限流。可稍后手动重跑，或调整配置区 DATA_SOURCES / 配置 TUSHARE_TOKEN。</p>
       <ul style="font-size:12px;color:#c0392b">{items}</ul>
     </div>"""
     _send(f"{MAIL_SUBJECT_PREFIX}⚠ 数据源异常 {dt.date.today()}", html)
@@ -367,26 +409,31 @@ def main():
         print(f"[skip] {today} 非交易日，退出")
         return
 
-    hits, failed = scan()
+    results, failed = scan()
     total = len(WATCH_LIST)
 
-    # 区分"数据挂了"和"确实无信号"
+    # 全部失败才发告警；只要有数据就照常出全景报告
     if len(failed) == total:
         print(f"[error] 全部 {total} 个标的数据获取失败，发告警邮件")
         send_data_alert(failed)
         return
     if failed:
-        print(f"[warn] {len(failed)}/{total} 个标的数据失败，其余正常处理")
+        print(f"[warn] {len(failed)}/{total} 个标的数据失败，其余照常入报告")
 
-    if not hits:
-        print(f"[info] 数据正常，今日确无标的达到连跌阈值（成功{total-len(failed)}个），不发报告")
-        return
+    hit_items = [r for r in results if r["is_hit"]]
 
-    market_news = fetch_market_news()
-    stock_news = fetch_stock_news(hits)
-    print(f"[info] 市场新闻 {len(market_news)} 条，个股新闻 {len(stock_news)} 条")
-    ai_text = analyze_with_llm(hits, market_news, stock_news)
-    send_report(hits, ai_text, len(market_news), failed)
+    # 只对连续下跌的标的抓新闻 + LLM 分析；无连跌则报告只含全景表
+    if hit_items:
+        market_news = fetch_market_news()
+        stock_news = fetch_stock_news(hit_items)
+        print(f"[info] {len(hit_items)}个连跌标的，市场新闻{len(market_news)}条，个股新闻{len(stock_news)}条")
+        ai_text = analyze_with_llm(hit_items, market_news, stock_news)
+        news_count = len(market_news)
+    else:
+        print("[info] 无标的达连跌阈值，仅发全景行情表")
+        ai_text, news_count = "", 0
+
+    send_report(results, hit_items, ai_text, news_count, failed)
 
 
 if __name__ == "__main__":
