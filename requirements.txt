@@ -1,4 +1,5 @@
 akshare
 pandas
 requests
+yfinance
  
