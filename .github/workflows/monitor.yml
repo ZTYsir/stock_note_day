@@ -2,18 +2,17 @@ name: oversold-monitor
 
 on:
   schedule:
-    # cron 用 UTC 时间。北京时间 15:05 = UTC 07:05（收盘后，当天K线已确定）
-    # 周一到周五运行；节假日靠脚本内交易日历判断跳过
+    # UTC 时间。北京时间 15:05 = UTC 07:05（收盘后，当天K线已确定）
     - cron: '5 7 * * 1-5'
-  workflow_dispatch:        # 允许在 Actions 页面手动触发一次
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -22,6 +21,7 @@ jobs:
 
       - name: Run monitor
         env:
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          MAIL_PASS:   ${{ secrets.MAIL_PASS }}
+          LLM_API_KEY:   ${{ secrets.LLM_API_KEY }}
+          MAIL_PASS:     ${{ secrets.MAIL_PASS }}
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}   # 可选，不配则跳过 Tushare 源
         run: python monitor.py
